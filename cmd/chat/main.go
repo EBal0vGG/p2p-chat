@@ -1,148 +1,134 @@
 package main
 
 import (
-	"bufio"
-	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
-	"strconv"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
-
-	"github.com/example/p2p-chat/internal/discovery"
-	"github.com/example/p2p-chat/internal/messages"
-	"github.com/example/p2p-chat/internal/peer"
-	"github.com/example/p2p-chat/internal/transport"
 )
 
-func main() {
-	name := flag.String("name", "anon", "your display name")
-	tcpPort := flag.Int("tcp-port", 45454, "local TCP port (0 for random)")
-	debug := flag.Bool("debug", false, "enable debug logs")
-	flag.Parse()
+type Presence struct {
+	ID   string
+	Name string
+	Addr string
+}
 
-	if *debug {
-		log.Printf("Starting with name=%s tcp-port=%d", *name, *tcpPort)
-	}
+var (
+	name   = flag.String("name", "anon", "Your name")
+	port   = flag.Int("tcp-port", 45454, "TCP port to listen on")
+	debug  = flag.Bool("debug", false, "Enable debug logging")
+	peers  = make(map[string]Presence)
+	selfID = uuid.New().String()
+)
 
-	id := uuid.NewString()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	pm := peer.NewManager(id, *name)
-	incoming := make(chan messages.Message, 32)
-
-	// 1) Start TCP listener first so we know real port to announce
-	actualTCP, err := transport.StartListener(ctx, pm, *tcpPort, id, *name, incoming)
+// Получаем все IPv4 адреса устройства
+func getLocalIPs() []string {
+	var ips []string
+	addrs, err := net.InterfaceAddrs()
 	if err != nil {
-		log.Fatalf("start tcp listener failed: %v", err)
+		return ips
 	}
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
+			ips = append(ips, ipnet.IP.String())
+		}
+	}
+	return ips
+}
 
-	// 2) Start discovery (uses StartDiscovery)
-	go func() {
-		err := discovery.StartDiscovery(ctx, *name, actualTCP, func(p discovery.Presence) {
-			host, portStr, err := net.SplitHostPort(p.Addr)
-			if err != nil {
-				return
+// Отправляем broadcast presence
+func broadcastPresence(conn *net.UDPConn) {
+	localIPs := getLocalIPs()
+	for _, lip := range localIPs {
+		p := Presence{ID: selfID, Name: *name, Addr: fmt.Sprintf("%s:%d", lip, *port)}
+		data, _ := json.Marshal(p)
+
+		broadcastIPs := []string{"192.168.1.255:33333", "172.18.255.255:33333"}
+		for _, baddr := range broadcastIPs {
+			if *debug {
+				log.Printf("[discovery] broadcast sent to %s", baddr)
 			}
-			port, _ := strconv.Atoi(portStr)
+			conn.WriteToUDP(data, &net.UDPAddr{IP: net.ParseIP(strings.Split(baddr, ":")[0]), Port: 33333})
+		}
+	}
+}
 
-			// --- фильтр: игнорируем себя ---
-			if p.Name == *name && host == discovery.GetLocalIP() {
+// Получаем presence от других
+func listenPresence(conn *net.UDPConn) {
+	buf := make([]byte, 1024)
+	localIPs := getLocalIPs()
+
+	for {
+		n, _, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		var p Presence
+		if err := json.Unmarshal(buf[:n], &p); err != nil {
+			continue
+		}
+
+		// игнорируем самого себя по ID и IP
+		if p.ID == selfID {
+			skip := false
+			for _, lip := range localIPs {
+				if strings.HasPrefix(p.Addr, lip) {
+					skip = true
+					break
+				}
+			}
+			if skip {
 				if *debug {
 					log.Printf("[discovery] skipped self presence from %s", p.Addr)
 				}
-				return
-			}
-			// -------------------------------
-
-			peerID := p.Addr
-			pm.AddOrUpdate(peer.Peer{
-				ID:       peerID,
-				Name:     p.Name,
-				Addr:     host,
-				TCPPort:  port,
-				LastSeen: time.Now(),
-			})
-			log.Printf("discovered peer: %s @ %s:%d", p.Name, host, port)
-		})
-		if err != nil && err != context.Canceled {
-			log.Printf("discovery stopped: %v", err)
-		}
-	}()
-
-	// 3) Periodically try to connect to known peers (if not connected)
-	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				peers := pm.List()
-				for _, p := range peers {
-					if p.ID == id {
-						continue
-					}
-					if pm.HasConn(p.ID) {
-						continue
-					}
-					// try connect (best-effort)
-					go transport.ConnectToPeer(ctx, pm, p, id, *name, incoming)
-				}
+				continue
 			}
 		}
-	}()
 
-	// 4) Print incoming messages
-	go func() {
-		for m := range incoming {
-			if m.Type == "msg" {
-				fmt.Printf("[%s] %s\n", m.Name, m.Text)
-			}
+		if _, ok := peers[p.ID]; !ok {
+			peers[p.ID] = p
+			log.Printf("discovered peer: %s @ %s", p.Name, p.Addr)
 		}
-	}()
+	}
+}
 
-	// 5) Read stdin — отправка сообщений / команды
-	scanner := bufio.NewScanner(os.Stdin)
-	fmt.Printf("Started p2p-chat as %s (id=%s)\n", *name, id)
+func main() {
+	flag.Parse()
+
+	addr := net.UDPAddr{IP: net.IPv4zero, Port: 33333}
+	udpConn, err := net.ListenUDP("udp4", &addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer udpConn.Close()
+
+	log.Printf("tcp listener on :%d", *port)
+	fmt.Printf("Started p2p-chat as %s (id=%s)\n", *name, selfID)
 	fmt.Println("Commands: /peers  /exit")
 	fmt.Println("Type message and Enter to send to all connected peers.")
-loop:
-	for {
-		fmt.Print("> ")
-		if !scanner.Scan() {
-			break
-		}
-		line := scanner.Text()
-		if strings.HasPrefix(line, "/") {
-			switch strings.TrimSpace(line) {
-			case "/peers":
-				fmt.Println(pm.String())
-			case "/exit":
-				fmt.Println("exiting...")
-				cancel()
-				break loop
-			default:
-				fmt.Println("unknown command:", line)
-			}
-			continue
-		}
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		msg := messages.NewChat(line, id, *name)
-		fmt.Printf("[you] %s\n", line)
-		pm.Broadcast(msg)
-	}
 
-	pm.CloseAll()
-	time.Sleep(200 * time.Millisecond)
+	// discovery listener
+	go listenPresence(udpConn)
+
+	// discovery broadcaster
+	go func() {
+		for {
+			broadcastPresence(udpConn)
+			time.Sleep(3 * time.Second)
+		}
+	}()
+
+	// graceful shutdown
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	<-sigs
+	log.Println("Shutting down...")
 }
