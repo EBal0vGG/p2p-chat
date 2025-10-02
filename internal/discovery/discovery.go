@@ -1,113 +1,145 @@
 package discovery
 
 import (
-    "context"
-    "encoding/json"
-    "log"
-    "net"
-    "time"
-
-    "github.com/example/p2p-chat/internal/peer"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net"
+	"time"
 )
 
-const announceInterval = 3 * time.Second
-
-// AnnouncePacket — формат UDP broadcast пакета
-type AnnouncePacket struct {
-    Type    string `json:"type"`
-    PeerID  string `json:"peer_id"`
-    Name    string `json:"name"`
-    TCPPort int    `json:"tcp_port"`
-    TS      int64  `json:"ts"`
+// Presence сообщение, которое узлы рассылают в локальной сети
+type Presence struct {
+	Name string `json:"name"`
+	Addr string `json:"addr"`
 }
 
-type Discovery struct {
-    port    int
-    tcpPort int
-    id      string
-    name    string
-    pm      *peer.Manager
+// StartDiscovery запускает механизм обнаружения соседей через broadcast.
+func StartDiscovery(ctx context.Context, name string, tcpPort int, foundPeer func(Presence)) error {
+	conn, err := net.ListenPacket("udp4", ":33333")
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	go listenLoop(ctx, conn, foundPeer)
+	go broadcastLoop(ctx, name, tcpPort)
+
+	<-ctx.Done()
+	return ctx.Err()
 }
 
-func New(port, tcpPort int, id, name string, pm *peer.Manager) *Discovery {
-    return &Discovery{port: port, tcpPort: tcpPort, id: id, name: name, pm: pm}
+func listenLoop(ctx context.Context, conn net.PacketConn, foundPeer func(Presence)) {
+	buf := make([]byte, 2048)
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("discovery stopped")
+			return
+		default:
+		}
+
+		conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		n, addr, err := conn.ReadFrom(buf)
+		if err != nil {
+			// таймауты/прочие ошибки — продолжаем
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			continue
+		}
+
+		var p Presence
+		if err := json.Unmarshal(buf[:n], &p); err == nil {
+			log.Printf("[discovery] received presence from %s (%s)", p.Name, addr.String())
+			foundPeer(p)
+		}
+	}
 }
 
-func (d *Discovery) Run(ctx context.Context) error {
-    // UDP listener
-    addr := net.UDPAddr{Port: d.port, IP: net.IPv4zero}
-    conn, err := net.ListenUDP("udp4", &addr)
-    if err != nil {
-        return err
-    }
-    defer conn.Close()
+func broadcastLoop(ctx context.Context, name string, tcpPort int) {
+	presence := Presence{
+		Name: name,
+		Addr: net.JoinHostPort(getLocalIP(), fmt.Sprintf("%d", tcpPort)),
+	}
+	data, _ := json.Marshal(presence)
 
-    // Start announcer
-    go d.announcer(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 
-    buf := make([]byte, 2048)
-    for {
-        select {
-        case <-ctx.Done():
-            return nil
-        default:
-            conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-            n, remote, err := conn.ReadFromUDP(buf)
-            if err != nil {
-                if ne, ok := err.(net.Error); ok && ne.Timeout() {
-                    continue
-                }
-                log.Printf("udp read error: %v", err)
-                continue
-            }
+		addrs, err := getBroadcastAddrs()
+		if err != nil {
+			log.Printf("[discovery] failed to get broadcast addresses: %v", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
 
-            var pkt AnnouncePacket
-            if err := json.Unmarshal(buf[:n], &pkt); err != nil {
-                log.Printf("bad announce from %v: %v", remote, err)
-                continue
-            }
+		for _, addr := range addrs {
+			// явно посылаем на каждый broadcast-адрес интерфейса
+			conn, err := net.DialUDP("udp4", nil, addr)
+			if err != nil {
+				continue
+			}
+			_, err = conn.Write(data)
+			conn.Close()
+			if err == nil {
+				log.Printf("[discovery] broadcast sent to %s", addr.String())
+			}
+		}
 
-            if pkt.PeerID == d.id {
-                // ignore our own announces
-                continue
-            }
-
-            // add/update peer
-            p := peer.Peer{
-                ID:      pkt.PeerID,
-                Name:    pkt.Name,
-                Addr:    remote.IP.String(),
-                TCPPort: pkt.TCPPort,
-                LastSeen: time.Now(),
-            }
-            d.pm.AddOrUpdate(p)
-            log.Printf("discovered peer: %s @ %s:%d", p.Name, p.Addr, p.TCPPort)
-        }
-    }
+		time.Sleep(3 * time.Second)
+	}
 }
 
-func (d *Discovery) announcer(ctx context.Context) {
-    baddr := &net.UDPAddr{IP: net.IPv4bcast, Port: d.port}
-    conn, err := net.DialUDP("udp4", nil, baddr)
-    if err != nil {
-        log.Printf("announcer dial error: %v", err)
-        return
-    }
-    defer conn.Close()
+func getLocalIP() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "127.0.0.1"
+	}
+	for _, addr := range addrs {
+		ipnet, ok := addr.(*net.IPNet)
+		if ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
+			return ipnet.IP.String()
+		}
+	}
+	return "127.0.0.1"
+}
 
-    ticker := time.NewTicker(announceInterval)
-    defer ticker.Stop()
+func getBroadcastAddrs() ([]*net.UDPAddr, error) {
+	var result []*net.UDPAddr
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
 
-    for {
-        select {
-        case <-ctx.Done():
-            return
-        case <-ticker.C:
-            pkt := AnnouncePacket{Type: "announce", PeerID: d.id, Name: d.name, TCPPort: d.tcpPort, TS: time.Now().Unix()}
-            data, _ := json.Marshal(pkt)
-            if _, err := conn.Write(data); err != nil {
-                log.Printf("announce write error: %v", err)
-            }
-        }
-    }
+	for _, iface := range ifaces {
+		// интерфейс должен быть поднят и поддерживать broadcast
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagBroadcast == 0 {
+			continue
+		}
+
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			ipnet, ok := addr.(*net.IPNet)
+			if !ok || ipnet.IP.To4() == nil {
+				continue
+			}
+
+			ip := ipnet.IP.To4()
+			mask := ipnet.Mask
+			bcast := make(net.IP, len(ip))
+			for i := 0; i < len(ip); i++ {
+				bcast[i] = ip[i] | ^mask[i]
+			}
+
+			udpAddr := &net.UDPAddr{IP: bcast, Port: 33333}
+			result = append(result, udpAddr)
+		}
+	}
+	return result, nil
 }
