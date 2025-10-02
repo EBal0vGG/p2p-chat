@@ -44,19 +44,49 @@ func getLocalIPs() []string {
 	return ips
 }
 
+// Получаем broadcast-адреса для всех интерфейсов
+func getBroadcastAddrs() []string {
+	var result []string
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return result
+	}
+	for _, iface := range ifaces {
+		addrs, _ := iface.Addrs()
+		for _, a := range addrs {
+			if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.To4() != nil {
+				ip := ipnet.IP.To4()
+				mask := ipnet.Mask
+				bcast := net.IPv4(
+					ip[0]|^mask[0],
+					ip[1]|^mask[1],
+					ip[2]|^mask[2],
+					ip[3]|^mask[3],
+				)
+				result = append(result, fmt.Sprintf("%s:33333", bcast.String()))
+			}
+		}
+	}
+	return result
+}
+
 // Отправляем broadcast presence
 func broadcastPresence(conn *net.UDPConn) {
 	localIPs := getLocalIPs()
+	broadcastIPs := getBroadcastAddrs()
+
 	for _, lip := range localIPs {
 		p := Presence{ID: selfID, Name: *name, Addr: fmt.Sprintf("%s:%d", lip, *port)}
 		data, _ := json.Marshal(p)
 
-		broadcastIPs := []string{"192.168.1.255:33333", "172.18.255.255:33333"}
 		for _, baddr := range broadcastIPs {
+			host, portStr, _ := strings.Cut(baddr, ":")
+			udpAddr := &net.UDPAddr{IP: net.ParseIP(host), Port: 33333}
 			if *debug {
 				log.Printf("[discovery] broadcast sent to %s", baddr)
 			}
-			conn.WriteToUDP(data, &net.UDPAddr{IP: net.ParseIP(strings.Split(baddr, ":")[0]), Port: 33333})
+			conn.WriteToUDP(data, udpAddr)
+			_ = portStr // порт всё равно фиксированный = 33333
 		}
 	}
 }
@@ -78,18 +108,13 @@ func listenPresence(conn *net.UDPConn) {
 
 		// игнорируем самого себя по ID и IP
 		if p.ID == selfID {
-			skip := false
 			for _, lip := range localIPs {
-				if strings.HasPrefix(p.Addr, lip) {
-					skip = true
-					break
+				if strings.HasPrefix(p.Addr, lip+":") {
+					if *debug {
+						log.Printf("[discovery] skipped self presence from %s", p.Addr)
+					}
+					goto skip
 				}
-			}
-			if skip {
-				if *debug {
-					log.Printf("[discovery] skipped self presence from %s", p.Addr)
-				}
-				continue
 			}
 		}
 
@@ -97,6 +122,7 @@ func listenPresence(conn *net.UDPConn) {
 			peers[p.ID] = p
 			log.Printf("discovered peer: %s @ %s", p.Name, p.Addr)
 		}
+	skip:
 	}
 }
 
