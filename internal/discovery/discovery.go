@@ -111,35 +111,48 @@ func GetLocalIP() string {
 }
 
 func getBroadcastAddrs() ([]*net.UDPAddr, error) {
-	var result []*net.UDPAddr
+	var addrs []*net.UDPAddr
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil, err
 	}
 
 	for _, iface := range ifaces {
-		// интерфейс должен быть поднят и поддерживать broadcast
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagBroadcast == 0 {
+		// пропускаем down и loopback
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
 		}
 
-		addrs, _ := iface.Addrs()
-		for _, addr := range addrs {
-			ipnet, ok := addr.(*net.IPNet)
+		addrsList, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, a := range addrsList {
+			ipnet, ok := a.(*net.IPNet)
 			if !ok || ipnet.IP.To4() == nil {
 				continue
 			}
 
 			ip := ipnet.IP.To4()
-			mask := ipnet.Mask
-			bcast := make(net.IP, len(ip))
-			for i := 0; i < len(ip); i++ {
-				bcast[i] = ip[i] | ^mask[i]
+
+			// пропускаем ненужные диапазоны
+			if ip[0] == 169 && ip[1] == 254 { // link-local
+				continue
+			}
+			if ip[0] == 172 && (ip[1] == 17 || ip[1] == 18) { // docker/wsl
+				continue
 			}
 
-			udpAddr := &net.UDPAddr{IP: bcast, Port: 33333}
-			result = append(result, udpAddr)
+			// оставляем только нормальные подсети
+			broadcast := make(net.IP, len(ip))
+			for i := 0; i < 4; i++ {
+				broadcast[i] = ip[i] | ^ipnet.Mask[i]
+			}
+
+			addr := &net.UDPAddr{IP: broadcast, Port: 33333}
+			addrs = append(addrs, addr)
 		}
 	}
-	return result, nil
+	return addrs, nil
 }
