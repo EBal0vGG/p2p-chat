@@ -47,19 +47,22 @@ func main() {
 	// 2) Start discovery (uses StartDiscovery)
 	go func() {
 		err := discovery.StartDiscovery(ctx, *name, actualTCP, func(p discovery.Presence) {
-			// p.Addr == "ip:port"
 			host, portStr, err := net.SplitHostPort(p.Addr)
 			if err != nil {
-				log.Printf("bad presence addr: %v", err)
 				return
 			}
-			port := 0
-			if portStr != "" {
-				if pi, er := strconv.Atoi(portStr); er == nil {
-					port = pi
+			port, _ := strconv.Atoi(portStr)
+
+			// --- фильтр: игнорируем себя ---
+			if p.Name == *name && host == discovery.GetLocalIP() {
+				if *debug {
+					log.Printf("[discovery] skipped self presence from %s", p.Addr)
 				}
+				return
 			}
-			peerID := p.Addr // use addr as unique id in this MVP
+			// -------------------------------
+
+			peerID := p.Addr
 			pm.AddOrUpdate(peer.Peer{
 				ID:       peerID,
 				Name:     p.Name,

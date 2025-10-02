@@ -61,7 +61,7 @@ func listenLoop(ctx context.Context, conn net.PacketConn, foundPeer func(Presenc
 func broadcastLoop(ctx context.Context, name string, tcpPort int) {
 	presence := Presence{
 		Name: name,
-		Addr: net.JoinHostPort(getLocalIP(), fmt.Sprintf("%d", tcpPort)),
+		Addr: net.JoinHostPort(GetLocalIP(), fmt.Sprintf("%d", tcpPort)),
 	}
 	data, _ := json.Marshal(presence)
 
@@ -96,7 +96,7 @@ func broadcastLoop(ctx context.Context, name string, tcpPort int) {
 	}
 }
 
-func getLocalIP() string {
+func GetLocalIP() string {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
 		return "127.0.0.1"
